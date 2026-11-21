@@ -1,0 +1,9 @@
+.venv/
+weights/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+.env
+*.bin
+*.pt
