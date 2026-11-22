@@ -1,0 +1,127 @@
+"""Benchmark: greedy speculative decoding, gpt2 (124M) drafting for gpt2-medium (355M).
+
+For each k in --ks: generate --tokens new tokens for each prompt with speculative
+decoding, check the output is identical to plain target greedy decoding, and record
+acceptance rate (accepted drafts / drafted), tokens per target forward, and tokens/s.
+Baselines: target greedy (one target forward per token) and draft greedy (gpt2 alone,
+for reference). All configs timed round-robin; median (min to max) of --runs runs.
+
+    .venv\\Scripts\\python.exe bench\\speculative_bench.py                    # CPU fp32
+    python bench/speculative_bench.py --device cuda --out speculative_t4     # Colab
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import sys
+from pathlib import Path
+
+import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from bench.common import RESULTS, machine_info, machine_md, time_interleaved  # noqa: E402
+from engine.data import wikitext2_test_text  # noqa: E402
+from engine.speculative import SpecStats, greedy_generate, speculative_generate  # noqa: E402
+from engine.tokenizer import encode  # noqa: E402
+from engine.torch_model import TorchGPT2, default_device  # noqa: E402
+from engine.weights import load_gpt2  # noqa: E402
+
+PROMPTS = {
+    "prose": "Alan Turing theorized that computers would one day become",
+    "code": "def fibonacci(n):\n    if n < 2:\n        return n\n    return",
+    "list": "The planets of the solar system, in order from the Sun, are",
+}
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--device", default=None)
+    ap.add_argument("--ks", default="2,4,6,8")
+    ap.add_argument("--tokens", type=int, default=128)
+    ap.add_argument("--runs", type=int, default=3)
+    ap.add_argument("--out", default="speculative")
+    args = ap.parse_args()
+    ks = [int(x) for x in args.ks.split(",")]
+    dev = args.device or default_device()
+    info = machine_info()
+    if info["power"] == "battery":
+        print("WARNING: on battery power; numbers will be low and noisy", flush=True)
+
+    hp_t, p_t = load_gpt2("gpt2-medium")
+    hp_d, p_d = load_gpt2("gpt2")
+    target = TorchGPT2(p_t, hp_t, device=dev)
+    draft = TorchGPT2(p_d, hp_d, device=dev)
+    del p_t, p_d
+    sync = torch.cuda.synchronize if str(target.device).startswith("cuda") else None
+
+    prompts = dict(PROMPTS)
+    wt = encode(wikitext2_test_text())
+    prompts["wikitext"] = wt[5000:5064]                  # a fixed 64-token slice
+    prompts = {n: (encode(p) if isinstance(p, str) else p) for n, p in prompts.items()}
+    N = args.tokens
+
+    # 1. correctness + acceptance stats (deterministic: greedy), doubles as warm-up
+    ref = {n: greedy_generate(target, ids, N) for n, ids in prompts.items()}
+    greedy_generate(draft, prompts["prose"], 8)
+    stats = {}
+    for k in ks:
+        st, same = SpecStats(), True
+        for n, ids in prompts.items():
+            same &= speculative_generate(target, draft, ids, N, k, st) == ref[n]
+        stats[k] = (st, same)
+        print(f"k={k}: acceptance {st.acceptance_rate:.3f}, {st.tokens_per_round:.2f} tokens/target "
+              f"forward, identical to target greedy: {same}", flush=True)
+
+    # 2. speed, round-robin
+    def run(fn):
+        return lambda: [fn(ids) for ids in prompts.values()]
+    fns = {"target greedy": run(lambda ids: greedy_generate(target, ids, N)),
+           "draft greedy (gpt2 alone)": run(lambda ids: greedy_generate(draft, ids, N))}
+    for k in ks:
+        fns[f"speculative k={k}"] = run(lambda ids, k=k: speculative_generate(target, draft, ids, N, k))
+    timing = time_interleaved(fns, runs=args.runs, warmup=False, sync=sync)
+    total = N * len(prompts)
+    base = timing["target greedy"]["median"]
+
+    rows = []
+    for name, s in timing.items():
+        k = int(name.split("=")[1]) if name.startswith("speculative") else ""
+        st, same = stats[k] if k else (None, True)
+        rows.append({
+            "method": name, "k": k,
+            "tok_per_s": round(total / s["median"], 2),
+            "tok_per_s_min": round(total / s["max"], 2), "tok_per_s_max": round(total / s["min"], 2),
+            "speedup_vs_target": round(base / s["median"], 3),
+            "acceptance_rate": round(st.acceptance_rate, 4) if st else "",
+            "tokens_per_target_forward": round(st.tokens_per_round, 3) if st else "",
+            "identical_to_target_greedy": same if st else "",
+        })
+        print(f"{name:28s} {total / s['median']:7.2f} tok/s  x{base / s['median']:.2f}", flush=True)
+
+    RESULTS.mkdir(parents=True, exist_ok=True)
+    with open(RESULTS / f"{args.out}.csv", "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    lines = [
+        "# Speculative decoding: gpt2 (124M) drafts for gpt2-medium (355M), greedy", "",
+        f"Generated by `bench/speculative_bench.py` on {target.device} ({target.dtype}). "
+        f"{len(prompts)} prompts ({', '.join(prompts)}), {N} new tokens each, batch size 1. "
+        "Acceptance = accepted draft tokens / drafted tokens; tokens per target forward "
+        "includes the target's own correction/bonus token. "
+        f"Speed: configs timed round-robin, {args.runs} runs, median (min to max).", "",
+        "## Machine", machine_md(info), "",
+        "## Results", "",
+        "| method | tokens/s | speedup vs target greedy | acceptance | tokens / target forward | output == target greedy |",
+        "|---|---|---|---|---|---|",
+    ]
+    for r in rows:
+        lines.append(f"| {r['method']} | {r['tok_per_s']:.2f} ({r['tok_per_s_min']:.2f} to {r['tok_per_s_max']:.2f}) | "
+                     f"{r['speedup_vs_target']:.2f}x | {r['acceptance_rate']} | {r['tokens_per_target_forward']} | "
+                     f"{r['identical_to_target_greedy']} |")
+    (RESULTS / f"{args.out}.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"wrote {RESULTS / (args.out + '.md')}")
+
+
+if __name__ == "__main__":
+    main()

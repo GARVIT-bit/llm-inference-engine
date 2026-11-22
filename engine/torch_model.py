@@ -68,7 +68,7 @@ def softmax(x, dim: int = -1):
 
 
 class TorchGPT2:
-    def __init__(self, params: dict, hparams: dict, device=None, dtype=None):
+    def __init__(self, params: dict, hparams: dict, device=None, dtype=None, attention: str = "torch"):
         self.device = torch.device(device or default_device())
         self.dtype = dtype or default_dtype(self.device)
         self.hp = hparams
@@ -76,6 +76,13 @@ class TorchGPT2:
         self.n_head = hparams["n_head"]
         self.eps = hparams["eps"]
         self.neg = torch.finfo(self.dtype).min
+        if attention not in ("torch", "triton"):
+            raise ValueError(attention)
+        if attention == "triton":
+            from kernels.attention_triton import HAS_TRITON
+            if not HAS_TRITON or self.device.type != "cuda":
+                raise RuntimeError("attention='triton' needs Triton and a CUDA device")
+        self.attention = attention   # used by forward_dense (prefill-style, one sequence)
 
     def new_cache(self, num_blocks: int, block_size: int = 16) -> PagedKVCache:
         return PagedKVCache(self.hp, num_blocks, block_size, self.device, self.dtype)
@@ -97,7 +104,11 @@ class TorchGPT2:
             h = layer_norm(x, **blk["ln_1"], eps=self.eps)
             q, k, v = linear(h, **blk["attn"]["c_attn"]).split(C, dim=-1)
             q, k, v = (t.view(T, H, D).transpose(0, 1) for t in (q, k, v))   # [H, T, D]
-            att = softmax(q @ k.transpose(1, 2) * (1.0 / math.sqrt(D)) + mask) @ v
+            if self.attention == "triton":
+                from kernels.attention_triton import triton_attention
+                att = triton_attention(q[None], k[None], v[None], causal=True)[0]
+            else:
+                att = softmax(q @ k.transpose(1, 2) * (1.0 / math.sqrt(D)) + mask) @ v
             x = x + linear(att.transpose(0, 1).reshape(T, C), **blk["attn"]["c_proj"])
             h = layer_norm(x, **blk["ln_2"], eps=self.eps)
             x = x + linear(gelu(linear(h, **blk["mlp"]["c_fc"])), **blk["mlp"]["c_proj"])
