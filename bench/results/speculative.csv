@@ -1,0 +1,7 @@
+method,k,tok_per_s,tok_per_s_min,tok_per_s_max,speedup_vs_target,acceptance_rate,tokens_per_target_forward,identical_to_target_greedy
+target greedy,,7.52,6.76,7.63,1.0,,,
+draft greedy (gpt2 alone),,18.13,12.28,21.82,2.41,,,
+speculative k=2,2,6.59,6.38,6.6,0.876,0.8144,2.612,True
+speculative k=4,4,7.4,6.2,8.38,0.983,0.6875,3.71,True
+speculative k=6,6,7.06,5.99,8.33,0.939,0.5914,4.491,True
+speculative k=8,8,5.82,5.57,8.2,0.773,0.5526,5.278,True

@@ -2,7 +2,7 @@
 
 GPT-2 inference written from scratch (NumPy reference, then PyTorch + a Triton kernel), verified against HuggingFace and sped up with a KV cache, int8 quantization, continuous batching, a block-based KV cache and speculative decoding, all served through an OpenAI-compatible streaming API.
 
-**Status:** Phase 4 (PyTorch backend, paged KV cache, continuous batching, OpenAI-compatible API) done (CPU + T4 numbers). See `CLAUDE.md` for the plan.
+**Status:** Phase 5 (speculative decoding + Triton attention) code done, CPU numbers in; T4 numbers pending the Colab run. See `CLAUDE.md` for the plan.
 
 ## Setup (Windows)
 
@@ -216,6 +216,52 @@ for ch in c.completions.create(model="gpt2", prompt="Alan Turing theorized", max
 
 \*The max-batch-64 static row is not a clean baseline. The scheduler prefills at most 4,096 prompt tokens per step, and these 64 prompts total 4,851. So static admitted about 54 requests, and the remaining ~10 waited for a second full wave: 638 decode steps instead of about 255. Treat 1.82× as "continuous vs static under the same prefill budget", not as pure batching. **The max-batch-16 row is the headline number.**
 
+### Phase 5: speculative decoding + Triton fused attention (`engine/speculative.py`, `kernels/attention_triton.py`)
+
+**Speculative decoding.** At batch size 1, a decode step is limited by reading the weights, not by arithmetic. So a big model checking 5 tokens in one forward costs about the same as generating 1. A small **draft** model (gpt2, 124M) guesses k tokens greedily, and the **target** (gpt2-medium, 355M, same tokenizer) runs one forward over `[last, d1 … dk]`. That gives the target's own greedy choice g0 … gk at every position. Then:
+- Accept the longest prefix where the draft agreed (d(i+1) == g(i)), say n tokens, and append g(n): the target's correction, or a free bonus token if all k matched. Each round emits n + 1 tokens for **one** target forward.
+- Every emitted token is a target greedy token, so the **output is identical to the target's greedy output**. The draft only changes how many tokens come out per target forward.
+- **KV rollback** is cheap with the paged cache: rejected tokens are dropped by lowering `table.length`, and their slots get overwritten next round. The draft cache also tracks which accepted tokens it has already seen (when all k match, the draft never fed the last one, so it is fed at the start of the next round).
+- Only greedy verification is implemented, not the rejection-sampling variant for temperature > 0.
+
+**Tests** (`tests/test_speculative.py`):
+- Speculative output == gpt2-medium greedy output, token for token, for k = 1, 2, 4, 8 on 3 prompts (fp32).
+- Using the same model as draft and target accepts every draft (k + 1 tokens per round).
+- Edge cases: 1–7 output tokens, a 1-token prompt, and generating up to the 1024-token context limit (the draft length shrinks to fit).
+
+**Results** (`bench/speculative_bench.py` → `bench/results/speculative.md`, laptop CPU fp32 on AC, 4 prompts × 128 tokens, 3 runs round-robin, median):
+
+| | tok/s | vs target greedy | acceptance | tokens / target forward | output == target greedy |
+|---|---|---|---|---|---|
+| target greedy (gpt2-medium) | 7.52 | 1.00× | | 1 | |
+| draft alone (gpt2) | 18.13 | 2.41× | | | |
+| speculative k = 2 | 6.59 | 0.88× | 0.81 | 2.61 | yes |
+| speculative k = 4 | 7.40 | 0.98× | 0.69 | 3.71 | yes |
+| speculative k = 6 | 7.06 | 0.94× | 0.59 | 4.49 | yes |
+| speculative k = 8 | 5.82 | 0.77× | 0.55 | 5.28 | yes |
+
+**On this CPU, speculation saves target forwards (3.7× fewer at k = 4) but not time.** Speculative decoding needs two things, and the laptop provides neither:
+1. **A cheap draft.** Here gpt2 costs 55 ms per token against gpt2-medium's 133 ms, a ratio of 0.41. Both share the same 50257 × 768+ output head, and per-forward overhead doesn't shrink with model size. Speculative decoding pays off when the draft is ~10× cheaper.
+2. **Near-free verification.** At k = 4, a round takes 3.71 / 7.40 = 501 ms. The 4 draft steps take about 220 ms, which leaves ~280 ms for verifying 5 tokens: about 2.1× a single-token step. A CPU is compute-bound, so 5 tokens cost more than 1.
+- The acceptance rates (0.55–0.81) are healthy. The math only works where verification is close to free, which is the GPU row below.
+- The timing spread is wide (k = 4 ranged from 6.2 to 8.4 tok/s), because the laptop had ~1 GB of RAM free while holding both models.
+
+**GPU (T4, fp16):** _placeholder: `bench/colab_gpu.ipynb` runs `speculative_bench.py --device cuda`; no GPU numbers yet._
+
+**Triton fused attention** (`kernels/attention_triton.py`). Naive attention writes a [T, T] score matrix per head to GPU memory, reads it back for the softmax, writes the probabilities, then reads them again for `@ v`. At T = 4096 that is 32 MB per head in fp16. The kernel (FlashAttention-style forward) never stores it:
+- One GPU program handles a 64-row tile of queries for one (batch, head) and walks over 64-column tiles of keys/values, stopping at the diagonal because the attention is causal.
+- For each tile it computes the scores in fast on-chip memory and keeps a **running row max m** and **running denominator l**. When a new tile raises the max, it rescales the old partial output by exp(m_old − m_new). This "online softmax" gives exactly softmax over the whole row, without ever holding the row.
+- It uses exp2 with log2(e) folded into the scale (the GPU's native exponent).
+- Memory goes from O(T²) to O(T) per head, and the kernel reads Q, K, V once per tile pass instead of shuttling the scores through GPU memory.
+- `kernels/attention_triton.py` also has `tiled_attention_reference`, the same loop in NumPy. It matches plain attention to 1e-10 for odd lengths and tile sizes, and stays finite with scores around 1e3. That way the algorithm is tested on the laptop; the Triton code itself is tested in Colab.
+- `TorchGPT2(..., attention="triton")` uses the kernel for prefill on CUDA (the decode path still uses the paged gather).
+
+**Tests** (`tests/test_attention_kernel.py`):
+- NumPy mirror vs the definition (causal and non-causal, T from 1 to 130, uneven tiles, large scores).
+- On CUDA: Triton fp16 vs an fp64 reference within 1e-2 for T in {1, 17, 64, 200, 1000} and D in {64, 128}; strided (non-contiguous) inputs; the full GPT-2 forward with Triton attention vs torch attention.
+
+**Results (T4):** _placeholder: `bench/attention_bench.py` (seq 256 to 4096, vs PyTorch naive attention) runs only on the Colab GPU; no numbers yet._
+
 ## Honest notes so far
 - Tokenizer is tiktoken's `gpt2` encoding, not my own BPE.
 - fp32 equality with HF is relative to logit scale (see Phase 2); the strict 1e-4 bound is enforced in fp64.
@@ -223,3 +269,4 @@ for ch in c.completions.create(model="gpt2", prompt="Alan Turing theorized", max
 - int8 is weight-only and slower than fp32 in NumPy (no fused int8 kernel); its win in this repo is memory, not speed (see Phase 3).
 - The static-batching baseline drops finished requests from the compute (it only wastes their slots), which is kinder than padded static batching.
 - The API covers what the benchmarks and the OpenAI client need: one prompt per request (n = 1), no `stop` sequences, no logprobs. One engine thread, one model, one device.
+- Speculative decoding is greedy-only (no rejection sampling for temperature > 0) and batch size 1; it is not wired into the server.
