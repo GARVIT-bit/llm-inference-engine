@@ -2,17 +2,18 @@
 
 GPT-2 inference written from scratch (NumPy reference, then PyTorch + a Triton kernel), verified against HuggingFace and sped up with a KV cache, int8 quantization, continuous batching, a block-based KV cache and speculative decoding, all served through an OpenAI-compatible streaming API.
 
-**Status:** Phase 1 (NumPy forward pass) done. See `CLAUDE.md` for the plan.
+**Status:** Phase 2 (HF match + KV cache) done. See `CLAUDE.md` for the plan.
 
 ## Setup (Windows)
 
 ```powershell
 uv venv .venv --python 3.12
-uv pip install --python .venv\Scripts\python.exe -r requirements.txt
+uv pip install --python .venv\Scripts\python.exe -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+uv pip install --python .venv\Scripts\python.exe -r requirements-dev.txt
 .venv\Scripts\python.exe -m pytest -q tests
 ```
 
-(Plain `py -3.12 -m venv .venv` + `pip install -r requirements.txt` works too.) The first run downloads `gpt2` `config.json` + `model.safetensors` (~550 MB) into `weights/` (gitignored). Pickled `.bin` files are never loaded.
+(Plain `py -3.12 -m venv .venv` + `pip install` works too.) torch is the CPU wheel. On Windows, torch ≥ 2.12 needs a recent Visual C++ Redistributable (`winget install --id Microsoft.VCRedist.2015+.x64 -e`), otherwise `import torch` fails looking for `VCRUNTIME140_THREADS.dll`. `transformers` (in `requirements-dev.txt`) is the test oracle only and is never imported by `engine/`. The first run downloads `gpt2` `config.json` + `model.safetensors` (~550 MB) into `weights/` (gitignored). Pickled `.bin` files are never loaded.
 
 ```powershell
 .venv\Scripts\python.exe generate.py "Alan Turing theorized that computers would one day become" --n 40
@@ -41,7 +42,41 @@ GPU benchmarks and the Triton kernel run on a free Colab/Kaggle T4 via `bench/co
 
 **Tests** (`tests/test_numpy_ops.py`, `tests/test_numpy_gpt2.py`): GELU vs exact erf-GELU, softmax stability at ±1000, layer norm stats, causal mask, "changing a later token doesn't change earlier outputs" (for both `mha` and the full model), weight shapes + parameter count, tokenizer round-trip, float32 logits, and the exact greedy continuation of the Turing prompt: *" the most powerful machines on the planet."*
 
+### Phase 2: match HuggingFace + KV cache (`tests/test_vs_huggingface.py`, `KVCache` in `engine/numpy_model.py`)
+
+**Matching HuggingFace.** HF's `GPT2LMHeadModel` (test-only oracle) is loaded from the same safetensors file, and logits are compared at **every position** for 5 prompts (1 to 61 tokens: prose, code, repeated text).
+- **fp64, both sides: max abs diff < 1e-4** (the spec). Measured ~1e-13 to 2e-12, which shows the two implementations compute the same function.
+- **fp32:** a raw 1e-4 bound would be testing rounding noise. GPT-2 logits reach |330|, where one fp32 ulp is ~3e-5, and HF's own fp32 logits differ from its fp64 logits by up to 9.6e-4. So fp32 is checked as max diff / max |logit| < 1e-5 (measured ≤ 3.4e-6), plus an identical argmax at every position.
+
+**KV cache.** In attention, the keys and values of past tokens never change once computed, so recomputing them every step is wasted work.
+- `KVCache` preallocates `k, v` of shape [n_layer, n_head, n_ctx, head_dim]. That is 75.5 MB fp32 for a full 1,024-token context (2 × 12 × 12 × 1024 × 64 × 4 bytes).
+- **Prefill:** run the whole prompt once, writing each layer's K/V into slots `0..T)`.
+- **Decode:** feed only the newest token. Its position is `cache.length`. Each layer writes its single K/V row at that slot and attends over slots `0..length]`. Cost per token goes from O(T) full-sequence work to one token's matmuls plus attention over T cached keys.
+- The causal mask generalises to `causal_mask(tq, tk)`: tq new queries at the end of a tk-long sequence, where query *i* sees keys ≤ tk − tq + i. Decode is just tq = 1. Chunked prefill works too.
+- `last_only=True` runs the 50257 × 768 output head on the final position only, which is all generation needs.
+
+**Tests** (`tests/test_kv_cache.py`):
+- Prefill logits equal uncached logits.
+- Decode one token at a time: each step's logits equal row *t* of a full uncached forward.
+- Chunked prefill equals single prefill.
+- Greedy tokens with the cache are identical to greedy tokens without it, for 3 prompts.
+- Mask offsets are correct, and overflowing n_ctx raises an error.
+
+**Results** (`bench/kv_cache_bench.py` → `bench/results/kv_cache.md`, i5-1135G7 laptop on AC power, fp32 NumPy; medians of 20 cached / 5 uncached samples for A, 3 runs each for B):
+
+| | L / N = 32 | 256 | 1024 |
+|---|---|---|---|
+| A. one decode step at context L: cached vs uncached tok/s | 30.3 vs 7.2 (**4.2×**) | 29.1 vs 1.31 (**22.2×**) | 25.4 vs 0.26 (**96.3×**) |
+| B. generate N tokens end to end: cached vs uncached tok/s | 31.7 vs 8.4 (**3.8×**) | 27.8 vs 2.1 (**13.2×**) | 23.3 vs not run |
+
+The speedup grows with length because uncached work per token grows linearly with context, while cached work stays nearly flat (the weights dominate; attention over T cached keys is small next to them at these lengths). End-to-end speedup is smaller than per-step speedup because it averages over all the shorter contexts along the way. Uncached N = 1014 takes tens of minutes per run, so it only runs with `--full`.
+
+**Benchmarking on a laptop** (lessons from getting these numbers):
+- Configs are timed **round-robin**, one sample of each per round, so CPU clock drift (turbo, thermals) is shared evenly instead of landing on whichever config ran last.
+- Cached and uncached decode steps are timed as **separate groups**. A 35 ms cached step timed right after a 4 s uncached forward runs throttled; mixed together, that made cached L = 32 look slower than L = 256.
+- **Plug the laptop in.** On battery the same benchmark ran ~40% slower and much noisier. The results file records the power source.
+
 ## Honest notes so far
 - Tokenizer is tiktoken's `gpt2` encoding, not my own BPE.
-- Phase 1 has not been compared to HuggingFace logits yet; that's the first thing in Phase 2 (1e-4 max abs diff target).
-- CPU only on this machine (no CUDA GPU); throughput numbers come in Phase 2 from `bench/` scripts.
+- fp32 equality with HF is relative to logit scale (see Phase 2); the strict 1e-4 bound is enforced in fp64.
+- CPU only on this machine (no CUDA GPU). All numbers so far are from an i5-1135G7 laptop CPU; GPU numbers come from the Colab notebook later.

@@ -1,0 +1,2 @@
+# Test-only: HuggingFace `transformers` is the correctness oracle, never used inside engine/.
+transformers

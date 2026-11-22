@@ -15,15 +15,17 @@ def main() -> None:
     ap.add_argument("prompt")
     ap.add_argument("--n", type=int, default=20, help="tokens to generate")
     ap.add_argument("--model", default="gpt2")
+    ap.add_argument("--no-cache", action="store_true", help="recompute the full sequence each step")
     args = ap.parse_args()
 
     hparams, params = load_gpt2(args.model)
     ids = encode(args.prompt)
     t0 = time.perf_counter()
-    out = generate(ids, params, hparams, args.n)
+    out = generate(ids, params, hparams, args.n, use_cache=not args.no_cache)
     dt = time.perf_counter() - t0
     print(args.prompt + decode(out))
-    print(f"\n[{args.n} tokens in {dt:.2f}s, {args.n / dt:.1f} tok/s, no KV cache]")
+    mode = "no KV cache" if args.no_cache else "KV cache"
+    print(f"\n[{args.n} tokens in {dt:.2f}s, {args.n / dt:.1f} tok/s, {mode}; not a benchmark, see bench/]")
 
 
 if __name__ == "__main__":
