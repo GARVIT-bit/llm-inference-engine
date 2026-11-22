@@ -140,8 +140,30 @@ def triton_attention(q, k, v, causal: bool = True, block_m: int = 64, block_n: i
         block_n = 32 if D >= 128 else 64
     o = torch.empty_like(q)
     grid = (triton.cdiv(T, block_m), B * H)
-    _attn_fwd[grid](q, k, v, o, LOG2E / math.sqrt(D),
-                    *q.stride(), *k.stride(), *v.stride(), *o.stride(),
-                    H, T, D=D, BLOCK_M=block_m, BLOCK_N=block_n, CAUSAL=causal,
-                    num_warps=num_warps, num_stages=num_stages)
+    global LAST_COMPILED
+    LAST_COMPILED = _attn_fwd[grid](q, k, v, o, LOG2E / math.sqrt(D),
+                                    *q.stride(), *k.stride(), *v.stride(), *o.stride(),
+                                    H, T, D=D, BLOCK_M=block_m, BLOCK_N=block_n, CAUSAL=causal,
+                                    num_warps=num_warps, num_stages=num_stages)
     return o
+
+
+LAST_COMPILED = None   # compiled kernel of the last launch (for bench/attention_tune.py diagnostics)
+
+
+def compiled_info(ck) -> dict:
+    """Registers, spills and whether the PTX uses tensor-core MMA instructions."""
+    info = {}
+    for name in ("n_regs", "n_spills"):
+        try:
+            info[name] = getattr(ck, name)
+        except Exception:
+            info[name] = None
+    try:
+        ptx = ck.asm["ptx"]
+        info["ptx_mma"] = ptx.count("mma.sync")
+        info["ptx_fma_f32"] = ptx.count("fma.rn.f32")
+        info["ptx_ld_local"] = ptx.count("ld.local")      # register spills read back
+    except Exception:
+        pass
+    return info
