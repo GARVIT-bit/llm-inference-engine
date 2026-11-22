@@ -1,8 +1,116 @@
 # LLM Inference Engine from Scratch
 
-GPT-2 inference written from scratch (NumPy reference, then PyTorch + a Triton kernel), verified against HuggingFace and sped up with a KV cache, int8 quantization, continuous batching, a block-based KV cache and speculative decoding, all served through an OpenAI-compatible streaming API.
+GPT-2 inference written from scratch:
+- OpenAI's released GPT-2 weights loaded into my own transformer code;
+- proven to match HuggingFace's logits;
+- then made faster one bottleneck at a time: a KV cache, int8 weights, a PyTorch backend with a paged KV cache and continuous batching, speculative decoding, and a Triton fused-attention kernel;
+- served through an OpenAI-compatible streaming API.
 
-**Status:** Phase 5 (speculative decoding + Triton attention) done, with CPU and T4 numbers. Phase 6 (ship: diagram, plots, final README) is next. See `CLAUDE.md` for the plan.
+Every optimisation is measured against the previous version by a script in `bench/` that writes its results file. No number in this README was typed in by hand.
+
+**Status:** all six phases done. CPU numbers come from an i5-1135G7 laptop; GPU numbers come from a free Colab Tesla T4.
+
+## Results at a glance
+
+| step | what it does | result | hardware | from |
+|---|---|---|---|---|
+| NumPy reference | GPT-2 forward pass in pure NumPy, loaded from safetensors | logits match HuggingFace to **~1e-12** (fp64, spec < 1e-4) at every position | CPU | `tests/test_vs_huggingface.py` |
+| KV cache | prefill once, then feed only the newest token | decode step at 1,024 tokens of context: **96× faster** (25.4 vs 0.26 tok/s) | laptop CPU | `bench/kv_cache_bench.py` |
+| int8 weights | per-output-channel symmetric int8, dequantized before each matmul | weights **3.9× smaller** (475 → 122 MB), WikiText-2 perplexity **+1.6%** (29.94 → 30.43); 3.2× *slower* in NumPy (no fused int8 kernel) | laptop CPU | `bench/int8_bench.py` |
+| PyTorch backend + paged KV cache | 16-token blocks, block tables, batched forward | matches NumPy to < 1e-4 (fp64); 64 concurrent sequences need only the blocks they use | CPU / T4 | `tests/test_torch_model.py` |
+| continuous batching | refill a finished request's slot on the next step | **1.46× throughput** (554 vs 380 tok/s), **0.58× median TTFT** vs static batching, 64 concurrent HTTP requests (no gain on the CPU, see Phase 4) | T4 | `bench/batching_bench.py` |
+| speculative decoding | gpt2 drafts k tokens, gpt2-medium verifies them in one pass | **1.24× faster** at k = 2, output **identical** to gpt2-medium greedy (0.98× on the CPU, see Phase 5) | T4 | `bench/speculative_bench.py` |
+| Triton fused attention | tiled, online-softmax causal attention kernel | **1.36× faster** than PyTorch attention at 4K tokens, **320× less memory**; ~12× slower than PyTorch's SDPA (no tensor cores on T4 + Triton) | T4 | `bench/attention_bench.py`, `bench/attention_tune.py` |
+
+![KV cache](docs/img/kv_cache.png)
+![Continuous batching](docs/img/batching.png)
+![Speculative decoding](docs/img/speculative.png)
+![Triton attention](docs/img/attention.png)
+![int8](docs/img/int8.png)
+
+The plots are drawn by `bench/plots.py` from the committed files in `bench/results/`; the exact numbers (with min–max spread) are in those files and in the per-phase tables below.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    C["OpenAI client / curl"] -- "HTTP, SSE stream" --> S["server/app.py<br/>FastAPI :8001"]
+    S -- "submit / abort,<br/>token callbacks" --> E["LLMEngine<br/>(background thread)"]
+    E --> SC["Scheduler<br/>admit · batched decode · preempt"]
+    SC --> M["TorchGPT2.forward_batch<br/>(CPU fp32 / CUDA fp16)"]
+    SC --> SA["sampler<br/>greedy · temperature · top-p"]
+    M <--> KV["PagedKVCache<br/>block pool + block tables"]
+    M -. "prefill on CUDA" .-> TR["Triton fused attention"]
+    W[("weights/*.safetensors")] --> L["engine/weights.py"]
+    L --> M
+    L --> NP["NumPy reference model<br/>(+ KV cache, int8)"]
+    SP["engine/speculative.py<br/>gpt2 drafts, gpt2-medium verifies"] --> M
+```
+
+**Correctness ladder.** Each rung is a test that runs in `pytest`. GPU rungs run in the Colab notebook.
+
+```mermaid
+flowchart LR
+    HF["HuggingFace GPT-2<br/>(test-only oracle)"] -- "fp64 < 1e-4" --> NP["NumPy model"]
+    NP -- "fp64 < 1e-4" --> T["Torch model"]
+    NP -- "cached == uncached" --> NPC["NumPy + KV cache"]
+    NP -- "perplexity within 3%" --> Q["int8 model"]
+    T -- "paged batch == dense" --> P["paged + batched"]
+    T -- "identical tokens" --> SPD["speculative"]
+    T -- "fp16 within 1e-2" --> TR["Triton attention"]
+```
+
+## Demo
+
+```powershell
+# 1. generate with the NumPy reference model (downloads gpt2 to weights/ on first run)
+.venv\Scripts\python.exe generate.py "Alan Turing theorized that computers would one day become" --n 40
+```
+
+```powershell
+# 2. start the OpenAI-compatible server (http://127.0.0.1:8001; add --policy static to compare)
+.venv\Scripts\python.exe -m server.app
+```
+
+```powershell
+# 3. in another terminal: a streaming completion with the official OpenAI client
+.venv\Scripts\python.exe -c "from openai import OpenAI; c = OpenAI(base_url='http://127.0.0.1:8001/v1', api_key='unused'); [print(x.choices[0].text, end='', flush=True) for x in c.completions.create(model='gpt2', prompt='The meaning of life is', max_tokens=40, temperature=0.8, top_p=0.95, stream=True)]"
+```
+
+```powershell
+# 4. the server's live counters (running/waiting sequences, free KV blocks, tokens, median TTFT)
+curl.exe http://127.0.0.1:8001/metrics
+```
+
+Reproduce the numbers (CPU scripts on the laptop; plug it in, since it throttles on battery):
+
+```powershell
+.venv\Scripts\python.exe -m pytest -q tests
+.venv\Scripts\python.exe bench\kv_cache_bench.py
+.venv\Scripts\python.exe bench\int8_bench.py
+.venv\Scripts\python.exe bench\batching_bench.py
+.venv\Scripts\python.exe bench\speculative_bench.py
+.venv\Scripts\python.exe bench\plots.py
+```
+
+GPU numbers: open `bench/colab_gpu.ipynb` in Colab with a T4 runtime and Run all. It clones this repo, runs the GPU tests and every GPU bench, and downloads the results as a zip for `bench/results/`.
+
+## Repository layout
+
+| path | what's in it |
+|---|---|
+| `engine/weights.py` | safetensors loading (`load_gpt2`), int8 quantization (`QInt8`, `quantize_int8`) |
+| `engine/numpy_model.py` | NumPy GPT-2: ops, attention, contiguous KV cache, int8 linear / head, greedy `generate` |
+| `engine/torch_model.py` | PyTorch GPT-2: dense reference + batched forward over the paged cache |
+| `engine/kv_cache.py` | block allocator, block tables, paged K/V pool |
+| `engine/sampler.py` | batched greedy / temperature / top-p sampling |
+| `engine/scheduler.py` | continuous / static batching, preemption, background `LLMEngine` |
+| `engine/speculative.py` | greedy speculative decoding with KV rollback |
+| `engine/eval.py`, `engine/data.py` | sliding-window perplexity, WikiText-2 test set |
+| `kernels/attention_triton.py` | Triton fused attention + its NumPy mirror |
+| `server/app.py` | FastAPI server: `/v1/completions` (SSE), `/v1/models`, `/metrics`, `/health` |
+| `bench/` | one script per measurement, `results/` (CSV + Markdown with machine details), `plots.py`, `colab_gpu.ipynb` |
+| `tests/` | 143 tests (120 run on CPU, 23 need CUDA and run in Colab): the correctness ladder plus unit tests per module |
 
 ## Setup (Windows)
 
@@ -13,13 +121,12 @@ uv pip install --python .venv\Scripts\python.exe -r requirements-dev.txt
 .venv\Scripts\python.exe -m pytest -q tests
 ```
 
-(Plain `py -3.12 -m venv .venv` + `pip install` works too.) torch is the CPU wheel. On Windows, torch ≥ 2.12 needs a recent Visual C++ Redistributable (`winget install --id Microsoft.VCRedist.2015+.x64 -e`), otherwise `import torch` fails looking for `VCRUNTIME140_THREADS.dll`. `transformers` (in `requirements-dev.txt`) is the test oracle only and is never imported by `engine/`. The first run downloads `gpt2` `config.json` + `model.safetensors` (~550 MB) into `weights/` (gitignored). Pickled `.bin` files are never loaded.
-
-```powershell
-.venv\Scripts\python.exe generate.py "Alan Turing theorized that computers would one day become" --n 40
-```
-
-GPU benchmarks and the Triton kernel run on a free Colab/Kaggle T4 via `bench/colab_gpu.ipynb`.
+Setup notes:
+- Plain `py -3.12 -m venv .venv` + `pip install` works too. torch is the CPU wheel.
+- On Windows, torch ≥ 2.12 needs a recent Visual C++ Redistributable (`winget install --id Microsoft.VCRedist.2015+.x64 -e`). Otherwise `import torch` fails looking for `VCRUNTIME140_THREADS.dll`.
+- `transformers` (in `requirements-dev.txt`) is the test oracle only and is never imported by `engine/`.
+- The first run downloads `gpt2` `config.json` + `model.safetensors` (~550 MB) into `weights/` (gitignored). The Phase 5 tests and benches also download `gpt2-medium` (~1.45 GB). Pickled `.bin` files are never loaded.
+- `matplotlib` (dev requirements) is used only by `bench/plots.py`.
 
 ## How it works
 
@@ -315,12 +422,36 @@ A second Colab session (`bench/results/batching_t4_run2.md`, `batching_t4_b64_ru
 - Closing that gap would need either a GPU where Triton emits MMA (Ampere or newer: Colab L4/A100, paid) or hand-written CUDA with `mma.sync`. Both are out of scope here.
 - Honest resume line: *"wrote a fused causal attention kernel in Triton (online softmax, O(T) memory); diagnosed register spills from compiled PTX and tuned it from 8× slower to 1.36× faster than PyTorch attention on a T4; 320× less memory at 4K tokens."*
 
-## Honest notes so far
-- Tokenizer is tiktoken's `gpt2` encoding, not my own BPE.
-- fp32 equality with HF is relative to logit scale (see Phase 2); the strict 1e-4 bound is enforced in fp64.
-- CPU only on this machine (no CUDA GPU). All numbers so far are from an i5-1135G7 laptop CPU; GPU numbers come from the Colab notebook later.
-- int8 is weight-only and slower than fp32 in NumPy (no fused int8 kernel); its win in this repo is memory, not speed (see Phase 3).
+## Limits and honest notes
+
+**The model.** GPT-2 is a 2019 architecture:
+- learned absolute position embeddings, not RoPE;
+- full multi-head attention, not GQA/MQA (so the KV cache is larger per token than in modern models);
+- LayerNorm + GELU, not RMSNorm + SwiGLU;
+- a 1,024-token context.
+
+The engine ideas (KV cache, paging, continuous batching, speculation, fused attention) carry over to newer models; the model code would not, unchanged.
+
+**The tokenizer** is tiktoken's `gpt2` encoding, not my own BPE.
+
+**Where the numbers come from:**
+- CPU numbers: one i5-1135G7 laptop (4 cores, AC power; it throttles ~40% on battery).
+- GPU numbers: a free Colab Tesla T4.
+- Each results file records its machine.
+- Nothing here was measured on a modern data-center GPU. The T4 is a 2018 Turing card, and on it Triton's `tl.dot` compiles to scalar FMAs, not tensor-core instructions (see Phase 5).
+- Single GPU only, no tensor or pipeline parallelism.
+
+**What didn't win, and why** (kept in the results on purpose):
+- **int8:** slower than fp32 in NumPy. There is no fused int8 kernel, so every step re-casts the weights; the win is memory, not speed.
+- **Continuous batching and speculative decoding on the laptop CPU:** both do what they should (fewer, fuller steps; up to 5× fewer target forwards) but give no speedup. On a CPU, step cost grows with the number of tokens per step. Both pay off on the T4.
+- **The Triton kernel:** beats naive PyTorch attention but is ~12× slower than PyTorch's SDPA on the T4. It is used only for prefill via `attention="triton"`, not by default.
+
+**Measurement choices worth knowing:**
+- fp32 equality with HF is relative to logit scale; the strict 1e-4 bound is enforced in fp64 (see Phase 2).
 - The static-batching baseline drops finished requests from the compute (it only wastes their slots), which is kinder than padded static batching.
-- The API covers what the benchmarks and the OpenAI client need: one prompt per request (n = 1), no `stop` sequences, no logprobs. One engine thread, one model, one device.
-- Speculative decoding is greedy-only (no rejection sampling for temperature > 0) and batch size 1; it is not wired into the server.
-- The Triton attention kernel beats naive PyTorch attention (1.16–1.36× on a T4) but is ~12× slower than PyTorch's SDPA: on the T4 with this Triton build, `tl.dot` compiles to scalar FMAs, not tensor-core MMA (see Phase 5). It is used only for prefill via `attention="triton"`, not by default.
+- The max-batch-64 static GPU number is also limited by the per-step prefill budget (see Phase 4); the max-batch-16 row is the clean comparison.
+
+**API scope:**
+- One prompt per request (n = 1); no `stop` sequences, no logprobs.
+- One engine thread, one model, one device.
+- Speculative decoding is greedy-only (no rejection sampling for temperature > 0), runs at batch size 1, and is not wired into the server.

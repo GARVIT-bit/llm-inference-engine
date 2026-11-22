@@ -1,3 +1,4 @@
 # Test-only: HuggingFace `transformers` is the correctness oracle, never used inside engine/.
 transformers
 openai   # tests that the official client works against our server
+matplotlib  # bench/plots.py only
