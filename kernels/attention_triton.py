@@ -126,9 +126,14 @@ if HAS_TRITON:
                  acc.to(O.dtype.element_ty), mask=offs_m[:, None] < T)
 
 
-def triton_attention(q, k, v, causal: bool = True, block_m: int = 64, block_n: int | None = None,
-                     num_warps: int = 4, num_stages: int = 2):
-    """q, k, v: [B, H, T, D] CUDA tensors (fp16/bf16/fp32), same T. Returns [B, H, T, D]."""
+def triton_attention(q, k, v, causal: bool = True, block_m: int = 64, block_n: int = 32,
+                     num_warps: int = 8, num_stages: int = 1):
+    """q, k, v: [B, H, T, D] CUDA tensors (fp16/bf16/fp32), same T. Returns [B, H, T, D].
+
+    Defaults come from bench/attention_tune.py on a T4 (D=64): the original 64x64 tiles
+    with 4 warps spilled 1,448 registers and ran 12x slower than this config, which has
+    no spills. Tuned for D=64; D=128 is tested for correctness only.
+    """
     if not HAS_TRITON:
         raise RuntimeError("Triton attention needs the triton package and a CUDA GPU")
     B, H, T, D = q.shape
@@ -136,8 +141,6 @@ def triton_attention(q, k, v, causal: bool = True, block_m: int = 64, block_n: i
         raise ValueError("q, k, v must have the same [B, H, T, D] shape")
     if D not in (16, 32, 64, 128):
         raise ValueError("head dim must be 16, 32, 64 or 128")
-    if block_n is None:   # smaller K/V tiles for D=128 so q/k/v tiles fit a T4's 64 KB shared memory
-        block_n = 32 if D >= 128 else 64
     o = torch.empty_like(q)
     grid = (triton.cdiv(T, block_m), B * H)
     global LAST_COMPILED

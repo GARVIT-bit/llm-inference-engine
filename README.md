@@ -290,12 +290,30 @@ A second Colab session (`bench/results/batching_t4_run2.md`, `batching_t4_b64_ru
 | 2048 | 17.1 | 145 | 1.16 | 960 MB | 6 MB | 1.8e-3 / 1.2e-3 |
 | 4096 | 68.4 | 570 | 3.95 | 3,840 MB | 12 MB | 2.0e-3 / 1.0e-3 |
 
-**What this kernel achieves, and what it doesn't (yet):**
+**First version: correct, memory-light, and slow.**
 - **Correct:** error against an fp32 reference is 1.0–1.2e-3, the same as PyTorch's production fused kernel (SDPA), and lower than naive fp16 attention.
-- **Memory:** extra memory grows linearly instead of quadratically. At 4096 tokens it needs 12 MB instead of 3,840 MB, **320× less**. That is the point of the online softmax, and it holds.
-- **Speed: it is not fast on the T4.** It is ~8× *slower* than naive attention (570 vs 68 ms at 4096) and ~145× slower than SDPA. It reaches 0.09 TFLOP/s on a GPU with ~65 TFLOP/s of fp16 tensor-core peak, so the tile loop is badly underusing the hardware.
-- **Not diagnosed yet.** Leading suspect, *unverified*: the T4 is a Turing GPU (compute capability 7.5), and Triton's fast `tl.dot` path targets Ampere (8.0) and newer. Other candidates are tile sizes, warp count and pipelining stages, which were not tuned.
-- Next steps: a block-size/warps sweep, profiling with Nsight, and a run on an Ampere GPU (Colab L4/A100 are paid). Until then the honest resume line is "correct, O(T)-memory fused attention kernel", **not** "faster attention".
+- **Memory:** extra memory grows linearly instead of quadratically. At 4096 tokens it needs 12 MB instead of 3,840 MB, **320× less**. That is the point of the online softmax.
+- **Speed:** with its first settings (64 × 64 tiles, 4 warps, 2 pipeline stages) it was ~8× *slower* than naive attention: 570 vs 68 ms at 4096, only 0.09 TFLOP/s. The table above is that version.
+
+**Diagnosis and tuning** (`bench/attention_tune.py` → `bench/results/attention_tune_t4.md`, Colab T4). The script times a plain Triton matmul against cuBLAS, inspects what the compiler emitted (registers, spills, and whether the PTX contains tensor-core `mma.sync` instructions), and sweeps 162 kernel configs, each checked for correctness. It found two separate problems:
+1. **Register spills: the 12× problem.** The first config compiled to 64 registers per thread with 1,448 spills to local memory, so every tile iteration went back and forth to slow memory. The best config (64-row query tiles, **32-column** key tiles, **8 warps**, 1 stage) uses 221 registers and **0 spills**. Most of the fast configs have no spills; the slow ones all spill.
+2. **No tensor cores on this T4 with this Triton: the remaining gap.** `mma.sync` appears **0 times** in the PTX of every config, including a plain Triton matmul. The `tl.dot` calls compile to scalar fp32 FMAs. Even Triton's plain 4096³ matmul reached only 1.1 TFLOP/s here, against 22.2 TFLOP/s for cuBLAS on the same GPU. So the kernel runs on the T4's CUDA cores, not its tensor cores. That limit comes from the T4 (Turing, compute capability 7.5) with this Triton build, not from the attention algorithm.
+
+**After tuning** (now the kernel's default settings; interleaved timing, median of 10 runs):
+
+| seq len | naive PyTorch (ms) | Triton, first config (ms) | Triton, tuned (ms) | tuned vs naive | max abs error |
+|---|---|---|---|---|---|
+| 256 | 0.436 | 3.451 | 0.377 | 1.16× | 9.9e-4 |
+| 512 | 1.179 | 10.024 | 1.085 | 1.09× | 9.6e-4 |
+| 1024 | 4.391 | 37.570 | 3.610 | 1.22× | 9.8e-4 |
+| 2048 | 17.250 | 145.637 | 13.452 | 1.28× | 9.9e-4 |
+| 4096 | 66.292 | 573.390 | 48.588 | **1.36×** | 9.5e-4 |
+
+- Tuning made the kernel **11.8× faster** than its first version, and it now **beats naive PyTorch attention by 1.16–1.36×** while using 320× less memory at 4096 tokens.
+- The gap to naive grows with length, because naive attention's O(T²) memory traffic grows faster.
+- It is still ~12× slower than PyTorch's SDPA (3.95 ms at 4096), which reaches tensor cores through hand-written CUDA kernels.
+- Closing that gap would need either a GPU where Triton emits MMA (Ampere or newer: Colab L4/A100, paid) or hand-written CUDA with `mma.sync`. Both are out of scope here.
+- Honest resume line: *"wrote a fused causal attention kernel in Triton (online softmax, O(T) memory); diagnosed register spills from compiled PTX and tuned it from 8× slower to 1.36× faster than PyTorch attention on a T4; 320× less memory at 4K tokens."*
 
 ## Honest notes so far
 - Tokenizer is tiktoken's `gpt2` encoding, not my own BPE.
@@ -305,4 +323,4 @@ A second Colab session (`bench/results/batching_t4_run2.md`, `batching_t4_b64_ru
 - The static-batching baseline drops finished requests from the compute (it only wastes their slots), which is kinder than padded static batching.
 - The API covers what the benchmarks and the OpenAI client need: one prompt per request (n = 1), no `stop` sequences, no logprobs. One engine thread, one model, one device.
 - Speculative decoding is greedy-only (no rejection sampling for temperature > 0) and batch size 1; it is not wired into the server.
-- The Triton attention kernel is correct and O(T)-memory but ~8× slower than naive PyTorch attention on the T4 (cause not yet diagnosed; see Phase 5). It is used only for prefill via `attention="triton"`, not by default.
+- The Triton attention kernel beats naive PyTorch attention (1.16–1.36× on a T4) but is ~12× slower than PyTorch's SDPA: on the T4 with this Triton build, `tl.dot` compiles to scalar FMAs, not tensor-core MMA (see Phase 5). It is used only for prefill via `attention="triton"`, not by default.
