@@ -2,7 +2,7 @@
 
 GPT-2 inference written from scratch (NumPy reference, then PyTorch + a Triton kernel), verified against HuggingFace and sped up with a KV cache, int8 quantization, continuous batching, a block-based KV cache and speculative decoding, all served through an OpenAI-compatible streaming API.
 
-**Status:** Phase 3 (int8 weight-only quantization) done. See `CLAUDE.md` for the plan.
+**Status:** Phase 4 (PyTorch backend, paged KV cache, continuous batching, OpenAI-compatible API) done; GPU numbers pending the Colab run. See `CLAUDE.md` for the plan.
 
 ## Setup (Windows)
 
@@ -110,8 +110,100 @@ The speedup grows with length because uncached work per token grows linearly wit
 - **Activation memory doesn't change:** activations and attention stay fp32, so peak extra memory during a forward pass is the same.
 - The fp32 decode numbers here (~23 tok/s) are lower than Phase 2's (~30) on the same code path: different run and thermal state. Compare within a table, not across tables.
 
+### Phase 4: PyTorch backend, paged KV cache, continuous batching, API (`engine/torch_model.py`, `engine/kv_cache.py`, `engine/sampler.py`, `engine/scheduler.py`, `server/app.py`)
+
+**PyTorch backend.** The same math as the NumPy model, written with plain tensor ops (matmuls, a hand-written softmax and layer norm; no `nn.Module` zoo, no SDPA). It runs fp32 on CPU and fp16 on CUDA. Layer-norm statistics and softmax are computed in fp32 even in fp16 mode, because fp16 variance underflows. Two entry points:
+- `forward_dense(ids)`: one sequence, no cache. This is the reference.
+- `forward_batch(seqs, cache)`: many sequences over the paged cache. Each brings its *new* tokens (a whole prompt on prefill, one token on decode) and its block table.
+
+**Paged KV cache** (`engine/kv_cache.py`). Phase 2's cache preallocated n_ctx = 1024 slots per sequence: 75.5 MB fp32, mostly empty for short requests, so 64 concurrent sequences would reserve 4.8 GB. Instead, all K/V live in one shared pool `[n_layer, num_blocks, 16, n_head, head_dim]`:
+- Each sequence owns a **block table**, the list of block ids holding its tokens in order. Position p is stored at `blocks[p // 16] * 16 + p % 16`.
+- Blocks come from a free list as a sequence grows (1.18 MB per 16 tokens in fp32) and go back when it finishes. Waste is at most 15 token slots per sequence.
+- Any free block can serve any sequence, so blocks don't need to be contiguous. A test checks scattered, out-of-order blocks.
+
+**Batched forward.** All new tokens of all sequences are flattened into one [N, 768] matrix, so every linear layer is one matmul for the whole batch. For attention:
+1. Each layer writes the new K/V into the pool at their slots (`index_copy_`).
+2. Each sequence's history is gathered through its block table into a padded [B, H, Lmax, 64] tensor.
+3. Queries are padded to [B, H, Tmax, 64].
+4. One mask removes both the future (key position > query position) and padding.
+
+That gather is a copy of every cached K/V per layer per step. A paged-attention kernel would read the blocks in place; that is what the kernel phase is for.
+
+**Sampler** (`engine/sampler.py`). Batched, with per-row settings:
+- temperature 0 → argmax;
+- otherwise sample from softmax(logits / T);
+- top-p keeps the smallest set of most-likely tokens whose mass reaches p (the top token is always kept), then `torch.multinomial` renormalises;
+- seeded with a `torch.Generator`.
+
+**Scheduler** (`engine/scheduler.py`). Each `step()`:
+1. **Admit** waiting requests while the batch has room (max_batch) and the pool has blocks for their prompts. A small headroom of one free block per running sequence is kept so the next decode step doesn't immediately run out. All newly admitted prompts are prefilled in one forward, and each gets its first token.
+2. **Decode:** one batched forward for every request that was already running. Each feeds its newest token, then a token is sampled.
+3. **Retire** finished requests (max_tokens, `<|endoftext|>`, or context full) and free their blocks.
+- **`continuous`** admits every step, so a finished request's slot is refilled at once. **`static`** admits a new batch only when the whole previous batch is done. Finished requests stop computing, but their slots stay empty, so the baseline is a little generous to static.
+- **Preemption:** if a decode step needs a block and none is free, the youngest running request is preempted. Its blocks are freed and it goes to the front of the queue. Later it is re-prefilled from prompt + tokens so far ("recompute" preemption). A test runs 5 requests in a pool that holds about half of them and checks the outputs are identical to unconstrained runs.
+- `LLMEngine` runs the scheduler in one background thread. `submit()` and `abort()` are thread-safe, and per-request callbacks deliver each token as it is sampled.
+
+**API server** (`server/app.py`, port 8001). Endpoints:
+- `POST /v1/completions` takes `prompt` (string or token ids), `max_tokens`, `temperature`, `top_p` and `stream`. Non-streaming returns OpenAI's `text_completion` JSON with `usage`. `stream: true` sends Server-Sent Events, `data: {chunk}` per token and then `data: [DONE]`.
+- `GET /v1/models`, `GET /health`, and `GET /metrics` (Prometheus text: running/waiting sequences, free blocks, tokens, preemptions, mean decode batch, median TTFT).
+
+Implementation details:
+- Each HTTP request registers callbacks that push tokens from the engine thread into an `asyncio.Queue` on the server loop (`call_soon_threadsafe`).
+- A GPT-2 token can be half of a multi-byte UTF-8 character, so the streamer holds back text that ends in U+FFFD until the rest arrives.
+- If the client disconnects mid-stream, the request is aborted and its blocks freed.
+- `ignore_eos` (a vLLM-style extension) lets the load test fix output lengths.
+- The official OpenAI Python client works against it, and a test proves it:
+
+```python
+from openai import OpenAI
+c = OpenAI(base_url="http://127.0.0.1:8001/v1", api_key="unused")
+for ch in c.completions.create(model="gpt2", prompt="Alan Turing theorized", max_tokens=30, stream=True):
+    print(ch.choices[0].text, end="", flush=True)
+```
+
+```powershell
+.venv\Scripts\python.exe -m server.app
+```
+
+(Flags: `--policy static`, `--max-batch`, `--num-blocks`, `--device`.)
+
+**Performance gotcha found while building it.** On CPU (MKL), `x @ wte.T` for a few rows of x against the 50257 × 768 embedding took 58 ms. Computing `(wte @ x.T).T` gives the same numbers in 21 ms. Together with `index_select` for the KV gather, this made a batch-16 decode step 1.4× faster.
+
+**Tests:**
+- `test_torch_model.py`: torch fp64 vs NumPy fp64 max diff < 1e-4; fp32 relative + argmax (same policy as the HF test). The paged mixed-length batch equals dense; decoding across 16-token block boundaries equals dense at every step; non-contiguous blocks work; torch greedy equals NumPy greedy; CUDA fp16 vs fp32 within 1e-2 (Colab only).
+- `test_paged_cache.py`: allocator, double free, out of blocks, reserve rounding, slot mapping.
+- `test_sampler.py`: greedy, nucleus never leaves the top-p set and renormalises correctly, temperature-1 frequencies match softmax, per-row settings, seeding.
+- `test_scheduler.py`: batched greedy equals single-sequence greedy (both policies); continuous refills slots while static waits; preemption keeps outputs identical; EOS and context-limit stops; abort; every block is always returned; the engine thread streams tokens.
+- `test_server.py`: JSON shape and usage, SSE chunks join to the non-streaming text, concurrent requests share decode steps (mean batch > 1.5), 4xx validation, Prometheus format, the UTF-8 hold-back, the **official OpenAI client** (plain + streaming) against a live uvicorn server, and a client disconnect aborting the request and freeing its blocks.
+
+**Results** (`bench/batching_bench.py` → `bench/results/batching.md`). 64 concurrent streaming requests over HTTP, prompts 16–128 tokens, outputs 16–256 tokens (seeded), max batch 16, 3 runs per policy:
+
+| i5-1135G7 laptop CPU, fp32, AC power | static | continuous | continuous / static |
+|---|---|---|---|
+| throughput (generated tok/s) | 65.3 (64.6 to 68.5) | 63.7 (63.4 to 68.0) | 0.98× |
+| TTFT p50 (s) | 39.5 (39.4 to 39.8) | 41.9 (33.0 to 43.6) | 1.06× |
+| TTFT p90 (s) | 108.2 (104.6 to 109.1) | 102.5 (93.0 to 102.6) | 0.95× |
+| time per output token p50 (ms) | 133 | 236 | |
+| batched decode steps | 1150 | 719 | 0.63× |
+| mean sequences per decode step | 7.8 | 12.5 | |
+
+**On this CPU, continuous batching does not win, and the numbers show why.**
+- Continuous batching keeps the batch full: 12.5 sequences per decode step instead of 7.8, and 37% fewer steps for the same 9,004 tokens. That only pays off if a step with 16 sequences costs about the same as a step with 1.
+- On a GPU it does, because decode is bound by reading the weights from memory, and the extra rows are nearly free.
+- On this 4-core laptop CPU, step cost grows almost in proportion to batch size. From the run above:
+  - static: 138 s / 1,150 steps = 120 ms per step at 7.8 sequences;
+  - continuous: 141 s / 719 steps = 197 ms per step at 12.5 sequences (including its prefills).
+- So the work per token is nearly the same however the requests are packed: 15.3 vs 15.7 ms per generated token.
+- So throughput and median TTFT come out even. The tail TTFT is ~5% better with continuous batching. Per-token latency is worse with it, because its steps are always full, while static batches drain down to a few sequences.
+- The scheduler is doing its job: fewer steps and fuller batches. The hardware just doesn't reward that.
+- The GPU run in `bench/colab_gpu.ipynb` measures the case continuous batching is built for. Until it has been run, there is no claim here that continuous batching is faster.
+
+**GPU (T4, fp16):** `bench/colab_gpu.ipynb` runs the same load test on CUDA. _Placeholder until the notebook has been run: no GPU numbers yet._
+
 ## Honest notes so far
 - Tokenizer is tiktoken's `gpt2` encoding, not my own BPE.
 - fp32 equality with HF is relative to logit scale (see Phase 2); the strict 1e-4 bound is enforced in fp64.
 - CPU only on this machine (no CUDA GPU). All numbers so far are from an i5-1135G7 laptop CPU; GPU numbers come from the Colab notebook later.
 - int8 is weight-only and slower than fp32 in NumPy (no fused int8 kernel); its win in this repo is memory, not speed (see Phase 3).
+- The static-batching baseline drops finished requests from the compute (it only wastes their slots), which is kinder than padded static batching.
+- The API covers what the benchmarks and the OpenAI client need: one prompt per request (n = 1), no `stop` sequences, no logprobs. One engine thread, one model, one device.

@@ -4,6 +4,9 @@ safetensors
 huggingface_hub
 pytest
 pyarrow  # reads the WikiText-2 parquet for perplexity eval
+fastapi
+uvicorn
+httpx    # load-test client in bench/
 # CPU wheel: install with --index-url https://download.pytorch.org/whl/cpu
 # Windows: torch >= 2.12 needs a recent VC++ Redistributable (VCRUNTIME140_THREADS.dll).
 torch

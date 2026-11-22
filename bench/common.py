@@ -82,6 +82,12 @@ def cpu_name() -> str:
                 return out
         except Exception:
             pass
+    try:  # Linux (Colab/Kaggle)
+        for line in open("/proc/cpuinfo"):
+            if line.startswith("model name"):
+                return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
     return platform.processor() or "unknown"
 
 
@@ -100,6 +106,11 @@ def machine_info() -> dict:
         info["blas"] = cfg["Build Dependencies"]["blas"]["name"]
     except Exception:
         pass
+    if "torch" in sys.modules:   # only report torch/GPU for benches that use it
+        import torch
+        info["torch"] = torch.__version__
+        info["torch_threads"] = torch.get_num_threads()
+        info["gpu"] = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none"
     return info
 
 
