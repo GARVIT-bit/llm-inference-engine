@@ -2,7 +2,7 @@
 
 GPT-2 inference written from scratch (NumPy reference, then PyTorch + a Triton kernel), verified against HuggingFace and sped up with a KV cache, int8 quantization, continuous batching, a block-based KV cache and speculative decoding, all served through an OpenAI-compatible streaming API.
 
-**Status:** Phase 5 (speculative decoding + Triton attention) code done, CPU numbers in; T4 numbers pending the Colab run. See `CLAUDE.md` for the plan.
+**Status:** Phase 5 (speculative decoding + Triton attention) done, with CPU and T4 numbers. Phase 6 (ship: diagram, plots, final README) is next. See `CLAUDE.md` for the plan.
 
 ## Setup (Windows)
 
@@ -216,6 +216,8 @@ for ch in c.completions.create(model="gpt2", prompt="Alan Turing theorized", max
 
 \*The max-batch-64 static row is not a clean baseline. The scheduler prefills at most 4,096 prompt tokens per step, and these 64 prompts total 4,851. So static admitted about 54 requests, and the remaining ~10 waited for a second full wave: 638 decode steps instead of about 255. Treat 1.82× as "continuous vs static under the same prefill budget", not as pure batching. **The max-batch-16 row is the headline number.**
 
+A second Colab session (`bench/results/batching_t4_run2.md`, `batching_t4_b64_run2.md`) reproduced these numbers: 1.43× throughput and 0.59× TTFT p50 at max batch 16, and 1.86× at max batch 64.
+
 ### Phase 5: speculative decoding + Triton fused attention (`engine/speculative.py`, `kernels/attention_triton.py`)
 
 **Speculative decoding.** At batch size 1, a decode step is limited by reading the weights, not by arithmetic. So a big model checking 5 tokens in one forward costs about the same as generating 1. A small **draft** model (gpt2, 124M) guesses k tokens greedily, and the **target** (gpt2-medium, 355M, same tokenizer) runs one forward over `[last, d1 … dk]`. That gives the target's own greedy choice g0 … gk at every position. Then:
@@ -246,7 +248,26 @@ for ch in c.completions.create(model="gpt2", prompt="Alan Turing theorized", max
 - The acceptance rates (0.55–0.81) are healthy. The math only works where verification is close to free, which is the GPU row below.
 - The timing spread is wide (k = 4 ranged from 6.2 to 8.4 tok/s), because the laptop had ~1 GB of RAM free while holding both models.
 
-**GPU (T4, fp16):** _placeholder: `bench/colab_gpu.ipynb` runs `speculative_bench.py --device cuda`; no GPU numbers yet._
+**GPU** (Colab Tesla T4, fp16, same script and prompts → `bench/results/speculative_t4.md`):
+
+| T4, fp16 | tok/s | vs target greedy | acceptance | tokens / target forward | output == target greedy |
+|---|---|---|---|---|---|
+| target greedy (gpt2-medium) | 31.98 | 1.00× | | 1 | |
+| draft alone (gpt2) | 60.59 | 1.90× | | | |
+| speculative k = 2 | 39.63 | **1.24×** | 0.81 | 2.61 | yes |
+| speculative k = 4 | 37.99 | 1.19× | 0.69 | 3.71 | yes |
+| speculative k = 6 | 33.88 | 1.06× | 0.59 | 4.49 | yes |
+| speculative k = 8 | 32.48 | 1.02× | 0.55 | 5.22 | yes |
+
+**On the GPU it pays off, and a two-number model predicts by how much.**
+- On the T4, verifying k + 1 tokens costs about one target step, so the second CPU problem is gone.
+- The first one remains. At batch size 1 a GPU forward is dominated by launching hundreds of small kernels per layer, so gpt2 (12 layers) costs about half of gpt2-medium (24 layers): c = 31.98 / 60.59 = 0.53.
+- Expected speedup ≈ (tokens per round) / (1 + k·c):
+  - k = 2: 2.61 / 2.06 = 1.27× (measured 1.24×);
+  - k = 4: 3.71 / 3.11 = 1.19× (measured 1.19×);
+  - k = 8: 5.22 / 5.24 = 1.0× (measured 1.02×).
+- So k = 2 is best here. A bigger gap between draft and target (or CUDA graphs to cut launch overhead) would move the best k up.
+- Output stayed identical to target greedy at every k, even in fp16.
 
 **Triton fused attention** (`kernels/attention_triton.py`). Naive attention writes a [T, T] score matrix per head to GPU memory, reads it back for the softmax, writes the probabilities, then reads them again for `@ v`. At T = 4096 that is 32 MB per head in fp16. The kernel (FlashAttention-style forward) never stores it:
 - One GPU program handles a 64-row tile of queries for one (batch, head) and walks over 64-column tiles of keys/values, stopping at the diagonal because the attention is causal.
@@ -260,7 +281,21 @@ for ch in c.completions.create(model="gpt2", prompt="Alan Turing theorized", max
 - NumPy mirror vs the definition (causal and non-causal, T from 1 to 130, uneven tiles, large scores).
 - On CUDA: Triton fp16 vs an fp64 reference within 1e-2 for T in {1, 17, 64, 200, 1000} and D in {64, 128}; strided (non-contiguous) inputs; the full GPT-2 forward with Triton attention vs torch attention.
 
-**Results (T4):** _placeholder: `bench/attention_bench.py` (seq 256 to 4096, vs PyTorch naive attention) runs only on the Colab GPU; no numbers yet._
+**Results** (`bench/attention_bench.py` → `bench/results/attention_t4.md`, Colab Tesla T4, fp16, batch 2 × 12 heads × head dim 64, causal, median of 20 runs). The Triton tests passed on the T4.
+
+| seq len | PyTorch naive (ms) | Triton fused (ms) | torch SDPA, reference only (ms) | naive peak memory | Triton peak memory | max abs error naive / Triton |
+|---|---|---|---|---|---|---|
+| 256 | 0.44 | 3.16 | 0.15 | 15 MB | 0.8 MB | 1.4e-3 / 1.0e-3 |
+| 1024 | 4.31 | 37.5 | 0.38 | 240 MB | 3 MB | 1.6e-3 / 1.0e-3 |
+| 2048 | 17.1 | 145 | 1.16 | 960 MB | 6 MB | 1.8e-3 / 1.2e-3 |
+| 4096 | 68.4 | 570 | 3.95 | 3,840 MB | 12 MB | 2.0e-3 / 1.0e-3 |
+
+**What this kernel achieves, and what it doesn't (yet):**
+- **Correct:** error against an fp32 reference is 1.0–1.2e-3, the same as PyTorch's production fused kernel (SDPA), and lower than naive fp16 attention.
+- **Memory:** extra memory grows linearly instead of quadratically. At 4096 tokens it needs 12 MB instead of 3,840 MB, **320× less**. That is the point of the online softmax, and it holds.
+- **Speed: it is not fast on the T4.** It is ~8× *slower* than naive attention (570 vs 68 ms at 4096) and ~145× slower than SDPA. It reaches 0.09 TFLOP/s on a GPU with ~65 TFLOP/s of fp16 tensor-core peak, so the tile loop is badly underusing the hardware.
+- **Not diagnosed yet.** Leading suspect, *unverified*: the T4 is a Turing GPU (compute capability 7.5), and Triton's fast `tl.dot` path targets Ampere (8.0) and newer. Other candidates are tile sizes, warp count and pipelining stages, which were not tuned.
+- Next steps: a block-size/warps sweep, profiling with Nsight, and a run on an Ampere GPU (Colab L4/A100 are paid). Until then the honest resume line is "correct, O(T)-memory fused attention kernel", **not** "faster attention".
 
 ## Honest notes so far
 - Tokenizer is tiktoken's `gpt2` encoding, not my own BPE.
@@ -270,3 +305,4 @@ for ch in c.completions.create(model="gpt2", prompt="Alan Turing theorized", max
 - The static-batching baseline drops finished requests from the compute (it only wastes their slots), which is kinder than padded static batching.
 - The API covers what the benchmarks and the OpenAI client need: one prompt per request (n = 1), no `stop` sequences, no logprobs. One engine thread, one model, one device.
 - Speculative decoding is greedy-only (no rejection sampling for temperature > 0) and batch size 1; it is not wired into the server.
+- The Triton attention kernel is correct and O(T)-memory but ~8× slower than naive PyTorch attention on the T4 (cause not yet diagnosed; see Phase 5). It is used only for prefill via `attention="triton"`, not by default.
