@@ -2,7 +2,7 @@
 
 GPT-2 inference written from scratch (NumPy reference, then PyTorch + a Triton kernel), verified against HuggingFace and sped up with a KV cache, int8 quantization, continuous batching, a block-based KV cache and speculative decoding, all served through an OpenAI-compatible streaming API.
 
-**Status:** Phase 4 (PyTorch backend, paged KV cache, continuous batching, OpenAI-compatible API) done; GPU numbers pending the Colab run. See `CLAUDE.md` for the plan.
+**Status:** Phase 4 (PyTorch backend, paged KV cache, continuous batching, OpenAI-compatible API) done (CPU + T4 numbers). See `CLAUDE.md` for the plan.
 
 ## Setup (Windows)
 
@@ -198,7 +198,23 @@ for ch in c.completions.create(model="gpt2", prompt="Alan Turing theorized", max
 - The scheduler is doing its job: fewer steps and fuller batches. The hardware just doesn't reward that.
 - The GPU run in `bench/colab_gpu.ipynb` measures the case continuous batching is built for. Until it has been run, there is no claim here that continuous batching is faster.
 
-**GPU (T4, fp16):** `bench/colab_gpu.ipynb` runs the same load test on CUDA. _Placeholder until the notebook has been run: no GPU numbers yet._
+**GPU** (Colab Tesla T4, fp16, same workload and script; `bench/colab_gpu.ipynb` → `bench/results/batching_t4*.md`; median of 3 runs, range in the files):
+
+| T4, fp16 | static | continuous | continuous / static |
+|---|---|---|---|
+| max batch 16: throughput (tok/s) | 380.2 | 554.4 | **1.46×** |
+| max batch 16: TTFT p50 / p90 (s) | 7.63 / 18.16 | 4.45 / 10.44 | **0.58×** p50 |
+| max batch 16: time per output token p50 (ms) | 21 | 23 | |
+| max batch 64: throughput (tok/s) | 630.9 | 1150.9 | 1.82×* |
+| max batch 64: TTFT p50 / p90 (s) | 2.69 / 9.89 | 0.29 / 0.30 | 0.11×* p50 |
+
+**The GPU result shows what the CPU run couldn't.**
+- On the T4 a decode step costs about the same with 16 sequences as with 7, because reading the weights dominates.
+- So the 37% fewer, fuller steps of continuous batching turn straight into 1.46× throughput.
+- Time to first token falls to 0.58×, because a freed slot is refilled on the next step instead of waiting for the slowest request in the batch.
+- Per-token latency rises slightly (21 → 23 ms), because every step carries a full batch plus new prefills.
+
+\*The max-batch-64 static row is not a clean baseline. The scheduler prefills at most 4,096 prompt tokens per step, and these 64 prompts total 4,851. So static admitted about 54 requests, and the remaining ~10 waited for a second full wave: 638 decode steps instead of about 255. Treat 1.82× as "continuous vs static under the same prefill budget", not as pure batching. **The max-batch-16 row is the headline number.**
 
 ## Honest notes so far
 - Tokenizer is tiktoken's `gpt2` encoding, not my own BPE.
