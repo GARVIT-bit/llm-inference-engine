@@ -2,7 +2,7 @@
 
 GPT-2 inference written from scratch (NumPy reference, then PyTorch + a Triton kernel), verified against HuggingFace and sped up with a KV cache, int8 quantization, continuous batching, a block-based KV cache and speculative decoding, all served through an OpenAI-compatible streaming API.
 
-**Status:** Phase 2 (HF match + KV cache) done. See `CLAUDE.md` for the plan.
+**Status:** Phase 3 (int8 weight-only quantization) done. See `CLAUDE.md` for the plan.
 
 ## Setup (Windows)
 
@@ -76,7 +76,42 @@ The speedup grows with length because uncached work per token grows linearly wit
 - Cached and uncached decode steps are timed as **separate groups**. A 35 ms cached step timed right after a 4 s uncached forward runs throttled; mixed together, that made cached L = 32 look slower than L = 256.
 - **Plug the laptop in.** On battery the same benchmark ran ~40% slower and much noisier. The results file records the power source.
 
+### Phase 3: int8 weight-only quantization (`QInt8` / `quantize_int8` in `engine/weights.py`, `linear` / `lm_head` in `engine/numpy_model.py`, `engine/eval.py`)
+
+**Quantizing.** Every big matrix (the 48 block projections and `wte`) is stored as int8 plus one fp32 scale per **output channel**: `scale = max|w_channel| / 127`, `q = round(w / scale)` clipped to ±127 (symmetric, no zero point). The largest weight in each channel maps to exactly ±127, and the rounding error per weight is at most scale / 2. Per-channel scales matter because channels' ranges differ a lot: one scale for the whole matrix would let a single outlier column crush the precision of all the others. For the Conv1D weights [in, out] the channel axis is 1. For `wte` [vocab, C] it is 0 (one scale per vocab row), because as the tied output head each row produces one logit. `wpe`, biases and layer norms (~0.6% of parameters) stay fp32. A zero channel gets scale 1 so nothing divides by zero.
+
+**Running it ("weight-only").** Activations stay fp32. Before each matmul the int8 weight is converted to fp32. Two tricks keep this from being painfully slow:
+- **Scale after the matmul.** `x @ (q · s) = (x @ q) · s`, because s is constant down each output column. So the weight is only *cast*, and the scale multiplies the small [T, out] result instead of the [in, out] weight.
+- **One reusable scratch buffer.** The cast writes into a single persistent fp32 buffer (9 MB, sized for the largest 768 × 3072 matrix) instead of allocating a new temporary per matmul. Fresh multi-MB allocations were page-faulted in on every call by Windows, which made the cast ~2× slower.
+- **Chunked output head.** Dequantizing all of `wte` at once would create a 154 MB fp32 temporary and wipe out the memory win, so the head runs in chunks of 2048 vocab rows.
+
+**Measuring perplexity** (`engine/eval.py`). Perplexity = exp(mean negative log-likelihood of each next token). The 287,644-token WikiText-2 raw test set is longer than GPT-2's 1024-token context, so it is scored in windows. Each window predicts its chunk of targets, and every token after the first is scored **exactly once**. (The common HuggingFace recipe silently skips the first token of every window after the first; a test catches that.) With stride < 1024, each window keeps up to 1024 tokens of earlier text as context: more context gives lower perplexity, at more compute.
+
+**Tests** (`tests/test_int8.py`, `tests/test_perplexity.py`):
+- Quantizer: error ≤ scale / 2 on both axes; each channel's max maps to ±127; zero channels are safe.
+- `linear` with int8 equals a matmul with the dequantized weight; the scratch buffer can be reused across matrix shapes; the chunked head equals the full dequantized head for a vocab size that isn't a multiple of the chunk.
+- Real model: int8 weights are 0.25–0.27× the fp32 bytes; per-position logit cosine similarity > 0.999 and top-1 agreement ≥ 90% for 3 prompts; int8 cached == uncached tokens; coherent generation.
+- Correctness-ladder rung: int8 perplexity within 3% of fp32 on 2 windows of WikiText-2.
+- Perplexity: stable log-softmax; strided windows score every token once; single-window perplexity matches HF's loss.
+
+**Results** (`bench/int8_bench.py` → `bench/results/int8.md`, i5-1135G7 laptop on AC power; decode medians of 20 samples, end to end 3 runs):
+
+| | fp32 | int8 | int8 / fp32 |
+|---|---|---|---|
+| stored weights | 474.7 MB | 121.8 MB | **0.26× (3.9× smaller)** |
+| WikiText-2 test perplexity (287,643 tokens, ctx 1024, stride 1024) | 29.94 | 30.43 | **+1.64%** |
+| decode step @ L = 32 / 256 / 1024 (tok/s) | 23.3 / 22.5 / 19.0 | 5.2 / 5.2 / 5.1 | 0.22–0.27× |
+| generate 256 tokens end to end (tok/s) | 21.0 | 6.7 | 0.32× |
+| extra memory during a 1024-token forward | 163 MB | 163 MB (+9 MB scratch) | 1.0× |
+
+**Reading the results honestly.**
+- **Memory is the real win:** weights shrink 3.9× for a 1.6% perplexity cost. On a GPU, weight memory is what limits model size and batch size.
+- **Speed is worse here, and that is expected:** NumPy has no int8 × fp32 matmul, so every step re-casts ~124M int8 weights to fp32 and *then* does the same fp32 matmul as before. That is extra work and extra memory traffic, so decoding is ~4× slower. Real int8 inference wins speed because a fused kernel reads int8 from memory and dequantizes in registers; decode is memory-bandwidth bound, so reading 4× fewer bytes is the speedup. NumPy can't express that kernel; the GPU phases are where speed comes from.
+- **Activation memory doesn't change:** activations and attention stay fp32, so peak extra memory during a forward pass is the same.
+- The fp32 decode numbers here (~23 tok/s) are lower than Phase 2's (~30) on the same code path: different run and thermal state. Compare within a table, not across tables.
+
 ## Honest notes so far
 - Tokenizer is tiktoken's `gpt2` encoding, not my own BPE.
 - fp32 equality with HF is relative to logit scale (see Phase 2); the strict 1e-4 bound is enforced in fp64.
 - CPU only on this machine (no CUDA GPU). All numbers so far are from an i5-1135G7 laptop CPU; GPU numbers come from the Colab notebook later.
+- int8 is weight-only and slower than fp32 in NumPy (no fused int8 kernel); its win in this repo is memory, not speed (see Phase 3).

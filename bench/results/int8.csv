@@ -1,0 +1,19 @@
+section,model,metric,value,extra
+memory,fp32,weights_mb,474.7,
+memory,fp32,peak_decode_mb,0.2,
+memory,fp32,peak_prefill1024_mb,163.12,
+memory,fp32,dequant_scratch_mb,0.0,
+memory,int8,weights_mb,121.78,
+memory,int8,peak_decode_mb,0.2,
+memory,int8,peak_prefill1024_mb,163.12,
+memory,int8,dequant_scratch_mb,9.0,
+decode_step,fp32,tok_per_s@L=32,23.288,min 21.562 max 25.276 runs 20
+decode_step,int8,tok_per_s@L=32,5.237,min 4.754 max 7.376 runs 20
+decode_step,fp32,tok_per_s@L=256,22.515,min 19.099 max 26.884 runs 20
+decode_step,int8,tok_per_s@L=256,5.222,min 4.213 max 9.020 runs 20
+decode_step,fp32,tok_per_s@L=1024,18.986,min 18.000 max 24.724 runs 20
+decode_step,int8,tok_per_s@L=1024,5.137,min 4.810 max 8.801 runs 20
+e2e_generate,fp32,tok_per_s@N=256,20.959,min 20.228 max 29.831 runs 3
+e2e_generate,int8,tok_per_s@N=256,6.65,min 5.340 max 7.620 runs 3
+perplexity,fp32,wikitext2_test_ppl,29.9384,tokens 287643 ctx 1024 stride 1024 time 2232s
+perplexity,int8,wikitext2_test_ppl,30.4303,tokens 287643 ctx 1024 stride 1024 time 2091s

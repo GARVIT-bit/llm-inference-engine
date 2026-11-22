@@ -8,6 +8,8 @@ import math
 
 import numpy as np
 
+from engine.weights import QInt8
+
 # NOTE: constants are plain Python floats on purpose. Under NumPy 2 (NEP 50), a
 # np.float64 scalar such as np.sqrt(2/np.pi) silently promotes float32 arrays
 # to float64, which doubled memory traffic and made the forward pass ~10x slower.
@@ -31,8 +33,59 @@ def layer_norm(x: np.ndarray, g: np.ndarray, b: np.ndarray, eps: float = 1e-5) -
     return g * (x - mean) / np.sqrt(var + eps) + b
 
 
-def linear(x: np.ndarray, w: np.ndarray, b: np.ndarray) -> np.ndarray:
+HEAD_CHUNK = 2048  # vocab rows dequantized at a time for the int8 output head
+
+# One reusable fp32 buffer for dequantizing int8 weights. Allocating a fresh 9-25 MB
+# temporary per matmul made Windows page-fault it in every call (~2x slower cast).
+# Sized for the largest matrix: c_fc/c_proj 768x3072 = 2.36M floats (9 MB);
+# head chunks are 2048x768 = 1.6M. Not thread-safe (the NumPy engine is single-threaded).
+_scratch = np.empty(0, np.float32)
+
+
+def _dequant_buf(shape) -> np.ndarray:
+    global _scratch
+    n = int(np.prod(shape))
+    if _scratch.size < n:
+        _scratch = np.empty(n, np.float32)
+    return _scratch[:n].reshape(shape)
+
+
+def scratch_nbytes() -> int:
+    return _scratch.nbytes
+
+
+def linear(x: np.ndarray, w, b: np.ndarray) -> np.ndarray:
+    if isinstance(w, QInt8):
+        # Weight-only int8: convert int8 -> fp32 before the matmul, then apply the
+        # per-output-channel scale to the OUTPUT: x @ (q * s) == (x @ q) * s because
+        # s is constant down each column. Saves a full multiply pass over the weight.
+        buf = _dequant_buf(w.q.shape)
+        np.copyto(buf, w.q, casting="unsafe")
+        return (x @ buf) * w.scale + b
     return x @ w + b  # w is [in, out] (GPT-2 Conv1D layout)
+
+
+def embed(wte, ids: np.ndarray) -> np.ndarray:
+    if isinstance(wte, QInt8):  # dequantize only the rows we look up
+        return wte.q[ids].astype(np.float32) * wte.scale[ids]
+    return wte[ids]
+
+
+def lm_head(x: np.ndarray, wte) -> np.ndarray:
+    """logits = x @ wte^T (tied embeddings)."""
+    if not isinstance(wte, QInt8):
+        return x @ wte.T
+    # wte is 50257 x 768: dequantizing it all at once would allocate a 154 MB fp32
+    # temporary and erase the memory win, so do it in vocab chunks. Scale is per vocab
+    # row = per output logit, so again it is applied after the matmul.
+    V, C = wte.q.shape
+    out = np.empty((x.shape[0], V), dtype=np.float32)
+    for i in range(0, V, HEAD_CHUNK):
+        j = min(i + HEAD_CHUNK, V)
+        buf = _dequant_buf((j - i, C))
+        np.copyto(buf, wte.q[i:j], casting="unsafe")
+        np.multiply(x @ buf.T, wte.scale[i:j].T, out=out[:, i:j])
+    return out
 
 
 def ffn(x: np.ndarray, c_fc: dict, c_proj: dict) -> np.ndarray:
@@ -118,7 +171,7 @@ def gpt2(token_ids, params: dict, hparams: dict, cache: KVCache | None = None,
     start = cache.length if cache is not None else 0
     if start + T > hparams["n_ctx"]:
         raise ValueError(f"sequence length {start + T} exceeds n_ctx {hparams['n_ctx']}")
-    x = params["wte"][ids] + params["wpe"][np.arange(start, start + T)]
+    x = embed(params["wte"], ids) + params["wpe"][np.arange(start, start + T)]
     for i, blk in enumerate(params["blocks"]):
         x = block(x, **blk, n_head=hparams["n_head"], eps=hparams["eps"], cache=cache, layer=i)
     if cache is not None:
@@ -126,7 +179,7 @@ def gpt2(token_ids, params: dict, hparams: dict, cache: KVCache | None = None,
     if last_only:
         x = x[-1:]
     x = layer_norm(x, **params["ln_f"], eps=hparams["eps"])
-    return x @ params["wte"].T  # tied embeddings: output head = wte^T
+    return lm_head(x, params["wte"])  # tied embeddings: output head = wte^T
 
 
 def generate(token_ids, params: dict, hparams: dict, n_new: int,
@@ -143,7 +196,7 @@ def generate(token_ids, params: dict, hparams: dict, n_new: int,
             ids.append(int(np.argmax(logits[-1])))
         return ids[len(token_ids):]
 
-    cache = KVCache(hparams, dtype=params["wte"].dtype)
+    cache = KVCache(hparams, dtype=params["wpe"].dtype)  # wpe is never quantized
     logits = gpt2(ids, params, hparams, cache=cache, last_only=True)   # prefill
     for i in range(n_new):
         ids.append(int(np.argmax(logits[-1])))
